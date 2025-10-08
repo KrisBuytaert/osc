@@ -5,6 +5,8 @@ GO=go
 GOFLAGS=-v
 INSTALL_PATH=/usr/local/bin
 
+all: clean lint build ## Clean, lint, and build
+
 help: ## Show this help message
 	@echo 'Usage: make [target]'
 	@echo ''
@@ -42,4 +44,3 @@ vet: ## Run go vet
 
 lint: fmt vet ## Run formatters and linters
 
-all: clean lint build ## Clean, lint, and build

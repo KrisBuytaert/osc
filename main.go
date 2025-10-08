@@ -223,7 +223,7 @@ func printUsage() {
 	fmt.Println("  nodes               Show node information")
 	fmt.Println("  shards              Show shard allocation")
 	fmt.Println("\nOptions:")
-	fmt.Println("  -c, --config <path> Config file path (default: config.yaml)")
+	fmt.Println("  -c, --config <path> Config file path (default: ~/.osc-config.yaml)")
 	fmt.Println("\nExample config.yaml:")
 	fmt.Println("  endpoint: https://localhost:9200")
 	fmt.Println("  username: admin")
@@ -231,10 +231,18 @@ func printUsage() {
 	fmt.Println("  insecure: true")
 }
 
+func getDefaultConfigPath() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "config.yaml"
+	}
+	return homeDir + "/.osc-config.yaml"
+}
+
 func main() {
 	args := os.Args[1:]
 
-	configPath := "config.yaml"
+	configPath := getDefaultConfigPath()
 	var command string
 	var indexName string
 
