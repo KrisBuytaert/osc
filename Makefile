@@ -4,6 +4,7 @@ BINARY_NAME=osc
 GO=go
 GOFLAGS=-v
 INSTALL_PATH=/usr/local/bin
+LDFLAGS=-s -w
 
 all: clean lint build ## Clean, lint, and build
 
@@ -18,7 +19,11 @@ deps: ## Download dependencies
 	$(GO) mod tidy
 
 build: deps ## Build the binary
-	$(GO) build $(GOFLAGS) -o $(BINARY_NAME) .
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) \
+		-ldflags="$(LDFLAGS)" \
+		-a -installsuffix cgo \
+		-o $(BINARY_NAME) . 
+
 
 clean: ## Remove build artifacts
 	$(GO) clean
