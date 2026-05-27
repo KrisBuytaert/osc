@@ -4,7 +4,8 @@ BINARY_NAME=osc
 GO=go
 GOFLAGS=-v
 INSTALL_PATH=/usr/local/bin
-LDFLAGS=-s -w
+LDFLAGS=-s -w -extldflags '-static'
+BUILD_TAGS=netgo osusergo
 
 all: clean lint build ## Clean, lint, and build
 
@@ -20,9 +21,10 @@ deps: ## Download dependencies
 
 build: deps ## Build the binary
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) \
+		-tags '$(BUILD_TAGS)' \
 		-ldflags="$(LDFLAGS)" \
-		-a -installsuffix cgo \
-		-o $(BINARY_NAME) . 
+		-a \
+		-o $(BINARY_NAME) .
 
 
 clean: ## Remove build artifacts
