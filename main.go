@@ -387,6 +387,7 @@ func main() {
 	configPath := getDefaultConfigPath()
 	explicitConfig := false
 	endpoint := "https://localhost:9200"
+	explicitEndpoint := false
 	certFile := "/etc/opensearch/tls/admin-cert.pem"
 	keyFile := "/etc/opensearch/tls/admin-key.pem"
 	var command string
@@ -405,6 +406,7 @@ func main() {
 		case "-e", "--endpoint":
 			if i+1 < len(args) {
 				endpoint = args[i+1]
+				explicitEndpoint = true
 				i++
 			}
 		case "--cert":
@@ -439,15 +441,15 @@ func main() {
 
 	config, err := loadConfig(configPath)
 	if err != nil {
-		if explicitConfig || !os.IsNotExist(err) {
+		if command != "generate-config" && (explicitConfig || !os.IsNotExist(err)) {
 			fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
 			os.Exit(1)
 		}
 		config = &Config{}
 	}
 
-	// CLI flags fill in defaults not set in config file
-	if config.Endpoint == "" {
+	// -e always wins; otherwise fall back to config file value, then built-in default
+	if explicitEndpoint || config.Endpoint == "" {
 		config.Endpoint = endpoint
 	}
 	if config.CertFile == "" {
@@ -644,11 +646,7 @@ func main() {
 		var body []byte
 		if extraArg != "" {
 			body = []byte(extraArg)
-		} else {
-			if stdinIsTTY() {
-				fmt.Fprintf(os.Stderr, "Error: body required (pass as argument or pipe via stdin)\n")
-				os.Exit(1)
-			}
+		} else if !stdinIsTTY() {
 			body, err = io.ReadAll(os.Stdin)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
@@ -753,11 +751,7 @@ func main() {
 		var body []byte
 		if extraArg != "" {
 			body = []byte(extraArg)
-		} else {
-			if stdinIsTTY() {
-				fmt.Fprintf(os.Stderr, "Error: body required (pass as argument or pipe via stdin)\n")
-				os.Exit(1)
-			}
+		} else if !stdinIsTTY() {
 			body, err = io.ReadAll(os.Stdin)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
