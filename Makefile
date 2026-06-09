@@ -51,3 +51,30 @@ vet: ## Run go vet
 
 lint: fmt vet ## Run formatters and linters
 
+COMPOSE_FILE    := tests/integration/docker-compose.yml
+COMPOSE_PROJECT := osc-inttest
+BATS_SUITE      := tests/integration
+
+.PHONY: test-integration test-integration-teardown
+
+test-integration: build ## Run integration tests against a local 2-node OpenSearch cluster
+	@command -v bats >/dev/null 2>&1 || \
+	  { echo "bats not found. Install: https://github.com/bats-core/bats-core"; exit 1; }
+	@command -v docker >/dev/null 2>&1 || \
+	  { echo "docker not found"; exit 1; }
+	@echo "==> Starting OpenSearch cluster..."
+	docker compose -p $(COMPOSE_PROJECT) -f $(COMPOSE_FILE) up -d --wait
+	@echo "==> Waiting for cluster health (yellow or better)..."
+	@until curl -sf "http://localhost:19200/_cluster/health?wait_for_status=yellow&timeout=5s" >/dev/null 2>&1; do \
+		sleep 3; echo "    still waiting..."; \
+	done
+	@echo "==> Running bats suite..."
+	OSC="$(PWD)/$(BINARY_NAME)" bats --tap $(BATS_SUITE); \
+	EXIT_CODE=$$?; \
+	echo "==> Tearing down..."; \
+	docker compose -p $(COMPOSE_PROJECT) -f $(COMPOSE_FILE) down -v; \
+	exit $$EXIT_CODE
+
+test-integration-teardown: ## Force remove integration test containers and volumes
+	docker compose -p $(COMPOSE_PROJECT) -f $(COMPOSE_FILE) down -v --remove-orphans
+

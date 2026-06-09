@@ -93,7 +93,7 @@ func newClient(config Config, showCurl bool) (*OSClient, error) {
 		showCurl: showCurl,
 		httpClient: &http.Client{
 			Transport: &http.Transport{TLSClientConfig: tlsCfg},
-			Timeout:   30 * time.Second,
+			Timeout:   120 * time.Second,
 		},
 	}, nil
 }
@@ -176,6 +176,14 @@ func (c *OSClient) request(method, path string, body []byte) ([]byte, error) {
 	}
 
 	return respBody, nil
+}
+
+func stdinIsTTY() bool {
+	stat, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (stat.Mode() & os.ModeCharDevice) != 0
 }
 
 func prettifyJSON(data []byte) (string, error) {
@@ -265,6 +273,54 @@ func (c *OSClient) GetShards() (string, error) {
 	return string(data), nil
 }
 
+func (c *OSClient) GetUnassignedShards() (string, error) {
+	data, err := c.request("GET", "/_cat/shards?v&h=index,shard,prirep,state,unassigned.reason,node", nil)
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	var result []string
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[0] == "index" || fields[3] == "UNASSIGNED" {
+			result = append(result, line)
+		}
+	}
+	return strings.Join(result, "\n"), nil
+}
+
+func (c *OSClient) GetVersions() (string, error) {
+	data, err := c.request("GET", "/_cat/nodes?v&h=name,version,build.type,jvm.version", nil)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (c *OSClient) GetDiskUsage() (string, error) {
+	data, err := c.request("GET", "/_cat/nodes?v&h=name,ip,diskUsed,diskAvail,diskUsedPercent", nil)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (c *OSClient) GetRecovery() (string, error) {
+	data, err := c.request("GET", "/_cat/recovery?v&h=index,shard,type,stage,source_node,target_node,bytes_percent,files_percent", nil)
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	var result []string
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[3] != "done" {
+			result = append(result, line)
+		}
+	}
+	return strings.Join(result, "\n"), nil
+}
+
 func printClusterHealth(health *ClusterHealth) {
 	fmt.Println("\n=== Cluster Health ===")
 	data, _ := json.MarshalIndent(health, "", "  ")
@@ -281,21 +337,33 @@ func printUsage() {
 	fmt.Println("OpenSearch CLI Tool")
 	fmt.Println("\nUsage: opensearch-cli [command] [options]")
 	fmt.Println("\nCommands:")
-	fmt.Println("  health              Show cluster health")
-	fmt.Println("  status              Show cluster status/stats")
-	fmt.Println("  indices             List all indices")
-	fmt.Println("  index <name>        Show health for specific index")
-	fmt.Println("  nodes               Show node information")
-	fmt.Println("  shards              Show shard allocation")
-	fmt.Println("  generate-config     Write a config file with current defaults")
-	fmt.Println("  get <path>          Raw GET request (e.g. get /_cat/indices?v)")
-	fmt.Println("  post <path> [body]  Raw POST request; body from arg or stdin")
+	fmt.Println("  health                     Show cluster health")
+	fmt.Println("  status                     Show cluster status/stats")
+	fmt.Println("  settings                   Show cluster settings")
+	fmt.Println("  indices                    List all indices")
+	fmt.Println("  index <name>               Show health for specific index")
+	fmt.Println("  nodes                      Show node information")
+	fmt.Println("  versions                   Show OpenSearch and JVM version per node")
+	fmt.Println("  shards                     Show shard allocation")
+	fmt.Println("  unassigned                 Show only unassigned shards with reasons")
+	fmt.Println("  disk                       Show disk usage per node")
+	fmt.Println("  recovery                   Show active (non-done) shard recoveries")
+	fmt.Println("  allocation-explain [body]  Explain shard allocation; optional JSON body targets a shard")
+	fmt.Println("  reroute <body>             POST _cluster/reroute; body from arg or stdin")
+	fmt.Println("  ism                        List ISM policies")
+	fmt.Println("  rebalance                  Re-enable allocation and retry failed shard assignments")
+	fmt.Println("  drain <node>               Exclude a node from receiving shards (triggers drain)")
+	fmt.Println("  undrain                    Clear node allocation exclusions")
+	fmt.Println("  generate-config            Write a config file with current defaults")
+	fmt.Println("  get <path>                 Raw GET request (e.g. get /_cat/indices?v)")
+	fmt.Println("  post <path> [body]         Raw POST request; body from arg or stdin")
+	fmt.Println("  put  <path> [body]         Raw PUT request; body from arg or stdin")
 	fmt.Println("\nOptions:")
 	fmt.Println("  -c, --config <path>    Config file path (default: ~/.osc-config.yaml)")
-	fmt.Println("  -e, --endpoint <url>  OpenSearch endpoint (default: https://localhost:9200)")
+	fmt.Println("  -e, --endpoint <url>   OpenSearch endpoint (default: https://localhost:9200)")
 	fmt.Println("  --cert <path>          Client certificate PEM (default: /etc/opensearch/tls/admin-cert.pem)")
 	fmt.Println("  --key  <path>          Client key PEM       (default: /etc/opensearch/tls/admin-key.pem)")
-	fmt.Println("  --curl              Print equivalent curl command to stderr")
+	fmt.Println("  --curl                 Print equivalent curl command to stderr")
 	fmt.Println("\nExample config.yaml:")
 	fmt.Println("  endpoint: https://localhost:9200")
 	fmt.Println("  username: admin")
@@ -470,6 +538,197 @@ func main() {
 		fmt.Println("\n=== Shards ===")
 		fmt.Println(shards)
 
+	case "versions":
+		data, err := client.GetVersions()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("\n=== Node Versions ===")
+		fmt.Println(data)
+
+	case "unassigned":
+		data, err := client.GetUnassignedShards()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("\n=== Unassigned Shards ===")
+		fmt.Println(data)
+
+	case "disk":
+		data, err := client.GetDiskUsage()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("\n=== Disk Usage per Node ===")
+		fmt.Println(data)
+
+	case "recovery":
+		data, err := client.GetRecovery()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("\n=== Active Recoveries ===")
+		fmt.Println(data)
+
+	case "settings":
+		data, err := client.request("GET", "/_cluster/settings?pretty", nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("\n=== Cluster Settings ===")
+		if pretty, err := prettifyJSON(data); err == nil {
+			fmt.Println(pretty)
+		} else {
+			fmt.Println(string(data))
+		}
+
+	case "allocation-explain":
+		method := "GET"
+		var body []byte
+		if indexName != "" {
+			method = "POST"
+			body = []byte(indexName)
+		}
+		data, err := client.request(method, "/_cluster/allocation/explain?pretty", body)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("\n=== Allocation Explain ===")
+		if pretty, err := prettifyJSON(data); err == nil {
+			fmt.Println(pretty)
+		} else {
+			fmt.Println(string(data))
+		}
+
+	case "reroute":
+		var body []byte
+		if indexName != "" {
+			body = []byte(indexName)
+		} else {
+			if stdinIsTTY() {
+				fmt.Fprintf(os.Stderr, "Error: reroute body required (pass as argument or pipe via stdin)\n")
+				os.Exit(1)
+			}
+			body, err = io.ReadAll(os.Stdin)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		if len(body) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: reroute body required\n")
+			os.Exit(1)
+		}
+		data, err := client.request("POST", "/_cluster/reroute?pretty", body)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if pretty, err := prettifyJSON(data); err == nil {
+			fmt.Println(pretty)
+		} else {
+			fmt.Println(string(data))
+		}
+
+	case "put":
+		if indexName == "" {
+			fmt.Fprintf(os.Stderr, "Error: path required\n")
+			os.Exit(1)
+		}
+		var body []byte
+		if extraArg != "" {
+			body = []byte(extraArg)
+		} else {
+			if stdinIsTTY() {
+				fmt.Fprintf(os.Stderr, "Error: body required (pass as argument or pipe via stdin)\n")
+				os.Exit(1)
+			}
+			body, err = io.ReadAll(os.Stdin)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		data, err := client.request("PUT", indexName, body)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if pretty, err := prettifyJSON(data); err == nil {
+			fmt.Println(pretty)
+		} else {
+			fmt.Println(string(data))
+		}
+
+	case "ism":
+		data, err := client.request("GET", "/_plugins/_ism/policies", nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("\n=== ISM Policies ===")
+		if pretty, err := prettifyJSON(data); err == nil {
+			fmt.Println(pretty)
+		} else {
+			fmt.Println(string(data))
+		}
+
+	case "rebalance":
+		_, err = client.request("PUT", "/_cluster/settings", []byte(`{"transient":{"cluster.routing.allocation.enable":"all"}}`))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error enabling allocation: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("cluster.routing.allocation.enable set to all")
+		data, err := client.request("POST", "/_cluster/reroute?retry_failed=true", nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error triggering reroute: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Reroute triggered:")
+		if pretty, err := prettifyJSON(data); err == nil {
+			fmt.Println(pretty)
+		} else {
+			fmt.Println(string(data))
+		}
+
+	case "drain":
+		if indexName == "" {
+			fmt.Fprintf(os.Stderr, "Error: node name required\n")
+			os.Exit(1)
+		}
+		body := fmt.Sprintf(`{"transient":{"cluster.routing.allocation.exclude._name":%q}}`, indexName)
+		data, err := client.request("PUT", "/_cluster/settings", []byte(body))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Node %q excluded from shard allocation\n", indexName)
+		if pretty, err := prettifyJSON(data); err == nil {
+			fmt.Println(pretty)
+		} else {
+			fmt.Println(string(data))
+		}
+
+	case "undrain":
+		data, err := client.request("PUT", "/_cluster/settings", []byte(`{"transient":{"cluster.routing.allocation.exclude._name":null,"cluster.routing.allocation.exclude._ip":null}}`))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Node exclusions cleared")
+		if pretty, err := prettifyJSON(data); err == nil {
+			fmt.Println(pretty)
+		} else {
+			fmt.Println(string(data))
+		}
+
 	case "get":
 		if indexName == "" {
 			fmt.Fprintf(os.Stderr, "Error: path required\n")
@@ -495,6 +754,10 @@ func main() {
 		if extraArg != "" {
 			body = []byte(extraArg)
 		} else {
+			if stdinIsTTY() {
+				fmt.Fprintf(os.Stderr, "Error: body required (pass as argument or pipe via stdin)\n")
+				os.Exit(1)
+			}
 			body, err = io.ReadAll(os.Stdin)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
