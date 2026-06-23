@@ -366,18 +366,26 @@ func (c *OSClient) GetOldVersionIndices() ([]OldVersionIndex, error) {
 		if err != nil {
 			continue
 		}
-		major := v / 1_000_000
-		if major >= 2 && major < 5 {
-			continue // OpenSearch 2.x/3.x/4.x — compatible
+
+		// Only flag indices in known-incompatible ranges.
+		// Integers outside these ranges use a newer encoding we can't decode
+		// and are almost certainly compatible with OpenSearch 3.x.
+		//   [1_000_000, 2_000_000) = OpenSearch 1.x
+		//   [5_000_000, 8_000_000) = Elasticsearch 5.x / 6.x / 7.x
+		osOne := v >= 1_000_000 && v < 2_000_000
+		esOld := v >= 5_000_000 && v < 8_000_000
+		if !osOne && !esOld {
+			continue
 		}
 
+		major := v / 1_000_000
 		display := s.Settings.Index.Version.CreatedString
 		if display == "" {
 			display = fmt.Sprintf("%d.%d.%d", major, (v%1_000_000)/10_000, (v%10_000)/100)
 		}
 
 		origin := "OpenSearch"
-		if major >= 5 {
+		if esOld {
 			origin = "Elasticsearch"
 		}
 		result = append(result, OldVersionIndex{Name: name, Version: display, Origin: origin})
