@@ -1,0 +1,62 @@
+# Two-node OpenSearch cluster with security disabled.
+# Why 2 nodes? Replicas can be assigned and UNASSIGNED scenarios are realistic.
+# Security disabled so tests use plain HTTP with no credentials.
+
+x-opensearch-common: &opensearch-common
+  image: opensearchproject/opensearch:2.13.0
+  environment:
+    - cluster.name=osc-test-cluster
+    - plugins.security.disabled=true
+    - DISABLE_INSTALL_DEMO_CONFIG=true
+    - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+    - bootstrap.memory_lock=false
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+    nofile:
+      soft: 65536
+      hard: 65536
+
+services:
+  os01:
+    <<: *opensearch-common
+    container_name: osc-test-os01
+    environment:
+      - cluster.name=osc-test-cluster
+      - node.name=os01
+      - discovery.seed_hosts=os02
+      - cluster.initial_cluster_manager_nodes=os01,os02
+      - plugins.security.disabled=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - bootstrap.memory_lock=false
+    ports:
+      - "${OS_PORT:-19200}:9200"
+    networks:
+      - osc-test
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  os02:
+    <<: *opensearch-common
+    container_name: osc-test-os02
+    environment:
+      - cluster.name=osc-test-cluster
+      - node.name=os02
+      - discovery.seed_hosts=os01
+      - cluster.initial_cluster_manager_nodes=os01,os02
+      - plugins.security.disabled=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - bootstrap.memory_lock=false
+    networks:
+      - osc-test
+
+networks:
+  osc-test:
+    driver: bridge

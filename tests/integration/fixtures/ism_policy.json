@@ -1,0 +1,9 @@
+{
+  "policy": {
+    "description": "osc integration test policy",
+    "default_state": "hot",
+    "states": [
+      { "name": "hot", "actions": [], "transitions": [] }
+    ]
+  }
+}

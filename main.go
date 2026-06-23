@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,6 +53,12 @@ type IndexHealth struct {
 	DocsDeleted  string `json:"docs.deleted"`
 	StoreSize    string `json:"store.size"`
 	PriStoreSize string `json:"pri.store.size"`
+}
+
+type OldVersionIndex struct {
+	Name    string
+	Version string
+	Origin  string // "OpenSearch" or "Elasticsearch"
 }
 
 type OSClient struct {
@@ -321,6 +329,165 @@ func (c *OSClient) GetRecovery() (string, error) {
 	return strings.Join(result, "\n"), nil
 }
 
+func (c *OSClient) GetOldVersionIndices() ([]OldVersionIndex, error) {
+	// Fetch only the version.created setting for all indices including system/hidden ones.
+	// OpenSearch 3.x refuses to open indices not created on OpenSearch 2.x, so we flag:
+	//   - major < 2  : OpenSearch 1.x (version integers 1_000_000–1_999_999)
+	//   - major >= 5 : Elasticsearch 5.x/6.x/7.x (version integers 5_000_000+)
+	// Indices in the 2_000_000–4_999_999 range (OS 2.x/3.x/4.x) are compatible.
+	data, err := c.request("GET", "/_all/_settings/index.version.created?expand_wildcards=all", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	type versionBlock struct {
+		Settings struct {
+			Index struct {
+				Version struct {
+					Created       string `json:"created"`
+					CreatedString string `json:"created_string"`
+				} `json:"version"`
+			} `json:"index"`
+		} `json:"settings"`
+	}
+
+	var raw map[string]versionBlock
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("failed to parse settings: %w", err)
+	}
+
+	var result []OldVersionIndex
+	for name, s := range raw {
+		versionStr := s.Settings.Index.Version.Created
+		if versionStr == "" {
+			continue
+		}
+		v, err := strconv.Atoi(versionStr)
+		if err != nil {
+			continue
+		}
+		major := v / 1_000_000
+		if major >= 2 && major < 5 {
+			continue // OpenSearch 2.x/3.x/4.x — compatible
+		}
+
+		display := s.Settings.Index.Version.CreatedString
+		if display == "" {
+			display = fmt.Sprintf("%d.%d.%d", major, (v%1_000_000)/10_000, (v%10_000)/100)
+		}
+
+		origin := "OpenSearch"
+		if major >= 5 {
+			origin = "Elasticsearch"
+		}
+		result = append(result, OldVersionIndex{Name: name, Version: display, Origin: origin})
+	}
+
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result, nil
+}
+
+// ReindexAsync starts a reindex task on the server and returns its task ID.
+// batchSize controls the scroll page size (default 1000).
+func (c *OSClient) ReindexAsync(source, dest string, batchSize int) (string, error) {
+	body := fmt.Sprintf(`{"source":{"index":%q,"size":%d},"dest":{"index":%q}}`, source, batchSize, dest)
+	data, err := c.request("POST", "/_reindex?wait_for_completion=false", []byte(body))
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		Task string `json:"task"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", err
+	}
+	return result.Task, nil
+}
+
+type ReindexResult struct {
+	Total            int
+	Created          int
+	Updated          int
+	VersionConflicts int
+	Failures         int
+}
+
+// pollTask blocks until the given task ID completes, printing progress to stderr.
+// Returns reindex stats so the caller can verify completeness.
+func (c *OSClient) pollTask(taskID string) (*ReindexResult, error) {
+	fmt.Fprintf(os.Stderr, "Waiting for task %s", taskID)
+	for {
+		time.Sleep(5 * time.Second)
+		data, err := c.request("GET", "/_tasks/"+taskID, nil)
+		if err != nil {
+			fmt.Fprintln(os.Stderr)
+			return nil, fmt.Errorf("polling task: %w", err)
+		}
+		var t struct {
+			Completed bool `json:"completed"`
+			Error     *struct {
+				Type   string `json:"type"`
+				Reason string `json:"reason"`
+			} `json:"error"`
+			Response struct {
+				Total            int               `json:"total"`
+				Created          int               `json:"created"`
+				Updated          int               `json:"updated"`
+				VersionConflicts int               `json:"version_conflicts"`
+				Failures         []json.RawMessage `json:"failures"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal(data, &t); err != nil {
+			fmt.Fprintln(os.Stderr)
+			return nil, err
+		}
+		if t.Completed {
+			fmt.Fprintln(os.Stderr, " done")
+			if t.Error != nil {
+				return nil, fmt.Errorf("task failed: %s: %s", t.Error.Type, t.Error.Reason)
+			}
+			return &ReindexResult{
+				Total:            t.Response.Total,
+				Created:          t.Response.Created,
+				Updated:          t.Response.Updated,
+				VersionConflicts: t.Response.VersionConflicts,
+				Failures:         len(t.Response.Failures),
+			}, nil
+		}
+		fmt.Fprintf(os.Stderr, ".")
+	}
+}
+
+func (c *OSClient) getDocCount(index string) (int, error) {
+	data, err := c.request("GET", "/"+index+"/_count", nil)
+	if err != nil {
+		return 0, err
+	}
+	var result struct {
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return 0, err
+	}
+	return result.Count, nil
+}
+
+func (c *OSClient) refreshIndex(index string) error {
+	_, err := c.request("POST", "/"+index+"/_refresh", nil)
+	return err
+}
+
+func (c *OSClient) deleteIndex(name string) error {
+	_, err := c.request("DELETE", "/"+name, nil)
+	return err
+}
+
+func (c *OSClient) createAlias(index, alias string) error {
+	body := fmt.Sprintf(`{"actions":[{"add":{"index":%q,"alias":%q}}]}`, index, alias)
+	_, err := c.request("POST", "/_aliases", []byte(body))
+	return err
+}
+
 func printClusterHealth(health *ClusterHealth) {
 	fmt.Println("\n=== Cluster Health ===")
 	data, _ := json.MarshalIndent(health, "", "  ")
@@ -348,6 +515,11 @@ func printUsage() {
 	fmt.Println("  unassigned                 Show only unassigned shards with reasons")
 	fmt.Println("  disk                       Show disk usage per node")
 	fmt.Println("  recovery                   Show active (non-done) shard recoveries")
+	fmt.Println("  old-indices                List indices incompatible with OpenSearch 3.x (OpenSearch 1.x or Elasticsearch origin)")
+	fmt.Println("  reindex <source> <dest>    Reindex source into dest (async by default, prints task ID)")
+	fmt.Println("    --batch-size N           Scroll page size (default 1000)")
+	fmt.Println("    --replace, -r            Wait for completion, verify counts, then delete source and alias source→dest")
+	fmt.Println("  rename <old> <new>         Delete old index and alias old->new (use after a completed reindex)")
 	fmt.Println("  allocation-explain [body]  Explain shard allocation; optional JSON body targets a shard")
 	fmt.Println("  reroute <body>             POST _cluster/reroute; body from arg or stdin")
 	fmt.Println("  ism                        List ISM policies")
@@ -364,6 +536,8 @@ func printUsage() {
 	fmt.Println("  --cert <path>          Client certificate PEM (default: /etc/opensearch/tls/admin-cert.pem)")
 	fmt.Println("  --key  <path>          Client key PEM       (default: /etc/opensearch/tls/admin-key.pem)")
 	fmt.Println("  --curl                 Print equivalent curl command to stderr")
+	fmt.Println("  --replace, -r          (reindex) Delete source and alias source→dest after success")
+	fmt.Println("  --batch-size N         (reindex) Scroll page size (default 1000)")
 	fmt.Println("\nExample config.yaml:")
 	fmt.Println("  endpoint: https://localhost:9200")
 	fmt.Println("  username: admin")
@@ -394,6 +568,8 @@ func main() {
 	var indexName string
 	var extraArg string
 	var showCurl bool
+	var replaceIndex bool
+	batchSize := 1000
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -421,6 +597,15 @@ func main() {
 			}
 		case "--curl":
 			showCurl = true
+		case "--replace", "-r":
+			replaceIndex = true
+		case "--batch-size":
+			if i+1 < len(args) {
+				if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
+					batchSize = n
+				}
+				i++
+			}
 		default:
 			if command == "" {
 				command = args[i]
@@ -713,6 +898,117 @@ func main() {
 		} else {
 			fmt.Println(string(data))
 		}
+
+	case "old-indices":
+		indices, err := client.GetOldVersionIndices()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("\n=== Indices incompatible with OpenSearch 3.x (require reindex) ===")
+		fmt.Println("(must have been created on OpenSearch 2.x or later)")
+		if len(indices) == 0 {
+			fmt.Println("None found.")
+			os.Exit(0)
+		}
+		fmt.Printf("\n%-55s  %-13s  %s\n", "INDEX", "ORIGIN", "CREATED VERSION")
+		fmt.Printf("%s  %s  %s\n", strings.Repeat("-", 55), strings.Repeat("-", 13), strings.Repeat("-", 15))
+		for _, idx := range indices {
+			fmt.Printf("%-55s  %-13s  %s\n", idx.Name, idx.Origin, idx.Version)
+		}
+
+	case "reindex":
+		if indexName == "" || extraArg == "" {
+			fmt.Fprintf(os.Stderr, "Usage: osc reindex <source-index> <dest-index> [--batch-size N] [--replace]\n")
+			os.Exit(1)
+		}
+		taskID, err := client.ReindexAsync(indexName, extraArg, batchSize)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if replaceIndex {
+			stats, err := client.pollTask(taskID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Reindex error: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Step 1: verify task-reported stats
+			written := stats.Created + stats.Updated
+			fmt.Printf("Reindex stats: total=%d created=%d updated=%d version_conflicts=%d failures=%d\n",
+				stats.Total, stats.Created, stats.Updated, stats.VersionConflicts, stats.Failures)
+			if stats.Failures > 0 {
+				fmt.Fprintf(os.Stderr, "Aborting replace: %d document failures reported. Source index preserved.\n", stats.Failures)
+				os.Exit(1)
+			}
+			if written != stats.Total {
+				fmt.Fprintf(os.Stderr, "Aborting replace: only %d/%d documents written. Source index preserved.\n", written, stats.Total)
+				os.Exit(1)
+			}
+
+			// Step 2: cross-check live doc counts (source still exists at this point)
+			fmt.Println("Verifying document counts...")
+			if err := client.refreshIndex(extraArg); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not refresh dest index: %v\n", err)
+			}
+			srcCount, err := client.getDocCount(indexName)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Aborting replace: could not count source docs: %v\n", err)
+				os.Exit(1)
+			}
+			dstCount, err := client.getDocCount(extraArg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Aborting replace: could not count dest docs: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("  source (%s): %d docs\n", indexName, srcCount)
+			fmt.Printf("  dest   (%s): %d docs\n", extraArg, dstCount)
+			if srcCount != dstCount {
+				fmt.Fprintf(os.Stderr, "Aborting replace: doc count mismatch (%d vs %d). Source index preserved.\n", srcCount, dstCount)
+				os.Exit(1)
+			}
+
+			// Step 3: replace
+			fmt.Println("Counts match. Replacing...")
+			if err := client.deleteIndex(indexName); err != nil {
+				fmt.Fprintf(os.Stderr, "Error deleting source index %q: %v\n", indexName, err)
+				os.Exit(1)
+			}
+			if err := client.createAlias(extraArg, indexName); err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating alias %q -> %q: %v\n", indexName, extraArg, err)
+				os.Exit(1)
+			}
+			fmt.Printf("Done: %s deleted, alias %s -> %s created\n", indexName, indexName, extraArg)
+		} else {
+			fmt.Printf("\nReindex task started: %s\n", taskID)
+			fmt.Println("\nMonitor progress:")
+			fmt.Printf("  osc get /_tasks/%s\n", taskID)
+			fmt.Println("\nOnce complete, to swap source for dest:")
+			fmt.Printf("  osc rename %s %s\n", indexName, extraArg)
+		}
+
+	case "rename":
+		if indexName == "" || extraArg == "" {
+			fmt.Fprintf(os.Stderr, "Usage: osc rename <old-index> <new-index>\n")
+			fmt.Fprintf(os.Stderr, "  Deletes old-index and creates an alias old-index -> new-index.\n")
+			fmt.Fprintf(os.Stderr, "  new-index must already contain the data (e.g. after a reindex).\n")
+			os.Exit(1)
+		}
+		// Verify dest exists before touching source
+		if _, err := client.request("GET", "/"+extraArg, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: dest index %q not found: %v\n", extraArg, err)
+			os.Exit(1)
+		}
+		if err := client.deleteIndex(indexName); err != nil {
+			fmt.Fprintf(os.Stderr, "Error deleting %q: %v\n", indexName, err)
+			os.Exit(1)
+		}
+		if err := client.createAlias(extraArg, indexName); err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating alias: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Done: %s deleted, alias %s -> %s created\n", indexName, indexName, extraArg)
 
 	case "undrain":
 		data, err := client.request("PUT", "/_cluster/settings", []byte(`{"transient":{"cluster.routing.allocation.exclude._name":null,"cluster.routing.allocation.exclude._ip":null}}`))

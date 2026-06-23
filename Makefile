@@ -73,17 +73,24 @@ test-integration: build ## Run integration tests against a local 2-node OpenSear
 	@command -v docker >/dev/null 2>&1 || \
 	  { echo "docker not found"; exit 1; }
 	@systemctl --user start podman.socket 2>/dev/null || true
-	@echo "==> Starting OpenSearch cluster..."
-	docker compose -p $(COMPOSE_PROJECT) -f $(COMPOSE_FILE) up -d --wait
-	@echo "==> Waiting for cluster health (yellow or better)..."
-	@until curl -sf "http://localhost:19200/_cluster/health?wait_for_status=yellow&timeout=5s" >/dev/null 2>&1; do \
+	@OS_PORT=19200; \
+	if curl -sf http://localhost:19200/ >/dev/null 2>&1; then \
+		echo "Port 19200 is in use, allocating a dynamic port..."; \
+		OS_PORT=0; \
+	fi; \
+	EXIT_CODE=0; \
+	export OS_PORT; \
+	echo "==> Starting OpenSearch cluster (OS_PORT=$$OS_PORT)..."; \
+	trap 'echo "==> Tearing down..."; docker compose -p $(COMPOSE_PROJECT) -f $(COMPOSE_FILE) down -v' EXIT INT TERM; \
+	docker compose -p $(COMPOSE_PROJECT) -f $(COMPOSE_FILE) up -d --wait || exit 1; \
+	ACTUAL_PORT=$$(docker compose -p $(COMPOSE_PROJECT) -f $(COMPOSE_FILE) port os01 9200 | cut -d: -f2); \
+	echo "==> Cluster is running on port $$ACTUAL_PORT"; \
+	echo "==> Waiting for cluster health (yellow or better)..."; \
+	until curl -sf "http://localhost:$$ACTUAL_PORT/_cluster/health?wait_for_status=yellow&timeout=5s" >/dev/null 2>&1; do \
 		sleep 3; echo "    still waiting..."; \
-	done
-	@echo "==> Running bats suite..."
-	OSC="$(PWD)/$(BINARY_NAME)" bats --tap $(BATS_SUITE); \
-	EXIT_CODE=$$?; \
-	echo "==> Tearing down..."; \
-	docker compose -p $(COMPOSE_PROJECT) -f $(COMPOSE_FILE) down -v; \
+	done; \
+	echo "==> Running bats suite..."; \
+	OS_URL="http://localhost:$$ACTUAL_PORT" OSC="$(PWD)/$(BINARY_NAME)" bats --tap $(BATS_SUITE) || EXIT_CODE=$$?; \
 	exit $$EXIT_CODE
 
 test-integration-teardown: ## Force remove integration test containers and volumes
