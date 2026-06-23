@@ -56,9 +56,10 @@ type IndexHealth struct {
 }
 
 type OldVersionIndex struct {
-	Name    string
-	Version string
-	Origin  string // "OpenSearch" or "Elasticsearch"
+	Name     string
+	Version  string // created_string
+	Origin   string // "OpenSearch" or "Elasticsearch"
+	Upgraded string // upgraded_string if present (index was upgraded in-place on a newer version)
 }
 
 type OSClient struct {
@@ -330,12 +331,9 @@ func (c *OSClient) GetRecovery() (string, error) {
 }
 
 func (c *OSClient) GetOldVersionIndices() ([]OldVersionIndex, error) {
-	// Fetch only the version.created setting for all indices including system/hidden ones.
-	// OpenSearch 3.x refuses to open indices not created on OpenSearch 2.x, so we flag:
-	//   - major < 2  : OpenSearch 1.x (version integers 1_000_000–1_999_999)
-	//   - major >= 5 : Elasticsearch 5.x/6.x/7.x (version integers 5_000_000+)
-	// Indices in the 2_000_000–4_999_999 range (OS 2.x/3.x/4.x) are compatible.
-	data, err := c.request("GET", "/_all/_settings/index.version.created?expand_wildcards=all", nil)
+	// ?human makes OpenSearch return created_string / upgraded_string alongside the raw integers.
+	// We fetch all index.version.* settings so we get both created and upgraded in one call.
+	data, err := c.request("GET", "/_all/_settings/index.version?expand_wildcards=all&human", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -344,8 +342,9 @@ func (c *OSClient) GetOldVersionIndices() ([]OldVersionIndex, error) {
 		Settings struct {
 			Index struct {
 				Version struct {
-					Created       string `json:"created"`
-					CreatedString string `json:"created_string"`
+					Created        string `json:"created"`
+					CreatedString  string `json:"created_string"`
+					UpgradedString string `json:"upgraded_string"`
 				} `json:"version"`
 			} `json:"index"`
 		} `json:"settings"`
@@ -358,37 +357,48 @@ func (c *OSClient) GetOldVersionIndices() ([]OldVersionIndex, error) {
 
 	var result []OldVersionIndex
 	for name, s := range raw {
-		versionStr := s.Settings.Index.Version.Created
-		if versionStr == "" {
-			continue
-		}
-		v, err := strconv.Atoi(versionStr)
-		if err != nil {
-			continue
-		}
+		createdStr := s.Settings.Index.Version.CreatedString
+		rawInt := s.Settings.Index.Version.Created
 
-		// Only flag indices in known-incompatible ranges.
-		// Integers outside these ranges use a newer encoding we can't decode
-		// and are almost certainly compatible with OpenSearch 3.x.
-		//   [1_000_000, 2_000_000) = OpenSearch 1.x
-		//   [5_000_000, 8_000_000) = Elasticsearch 5.x / 6.x / 7.x
-		osOne := v >= 1_000_000 && v < 2_000_000
-		esOld := v >= 5_000_000 && v < 8_000_000
-		if !osOne && !esOld {
-			continue
-		}
-
-		major := v / 1_000_000
-		display := s.Settings.Index.Version.CreatedString
-		if display == "" {
+		// Parse major version from created_string when available (reliable with ?human).
+		// Fall back to integer decoding only for very old indices without created_string.
+		var major int
+		display := createdStr
+		if createdStr != "" {
+			parts := strings.SplitN(createdStr, ".", 2)
+			if maj, err := strconv.Atoi(parts[0]); err == nil {
+				major = maj
+			}
+		} else if rawInt != "" {
+			v, err := strconv.Atoi(rawInt)
+			if err != nil {
+				continue
+			}
+			major = v / 1_000_000
 			display = fmt.Sprintf("%d.%d.%d", major, (v%1_000_000)/10_000, (v%10_000)/100)
+		} else {
+			continue
+		}
+
+		// OpenSearch 3.x requires created version >= 2.0.0.
+		// Flag: OS 1.x (major==1) and ES 5.x/6.x/7.x (major 5-7).
+		if major >= 2 && major < 5 {
+			continue
+		}
+		if major == 0 || major > 7 {
+			continue // unknown format, skip rather than false-positive
 		}
 
 		origin := "OpenSearch"
-		if esOld {
+		if major >= 5 {
 			origin = "Elasticsearch"
 		}
-		result = append(result, OldVersionIndex{Name: name, Version: display, Origin: origin})
+		result = append(result, OldVersionIndex{
+			Name:     name,
+			Version:  display,
+			Origin:   origin,
+			Upgraded: s.Settings.Index.Version.UpgradedString,
+		})
 	}
 
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
@@ -919,10 +929,14 @@ func main() {
 			fmt.Println("None found.")
 			os.Exit(0)
 		}
-		fmt.Printf("\n%-55s  %-13s  %s\n", "INDEX", "ORIGIN", "CREATED VERSION")
-		fmt.Printf("%s  %s  %s\n", strings.Repeat("-", 55), strings.Repeat("-", 13), strings.Repeat("-", 15))
+		fmt.Printf("\n%-55s  %-13s  %-7s  %s\n", "INDEX", "ORIGIN", "CREATED", "UPGRADED")
+		fmt.Printf("%s  %s  %s  %s\n", strings.Repeat("-", 55), strings.Repeat("-", 13), strings.Repeat("-", 7), strings.Repeat("-", 7))
 		for _, idx := range indices {
-			fmt.Printf("%-55s  %-13s  %s\n", idx.Name, idx.Origin, idx.Version)
+			upgraded := idx.Upgraded
+			if upgraded == "" {
+				upgraded = "—"
+			}
+			fmt.Printf("%-55s  %-13s  %-7s  %s\n", idx.Name, idx.Origin, idx.Version, upgraded)
 		}
 
 	case "reindex":
