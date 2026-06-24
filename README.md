@@ -5,6 +5,8 @@ I looked at opensearch-client, but it didn't support the basics — it just allo
 
 So I asked Claude to generate this little tool that reads a config file and makes life easier for me.
 
+> **Caution:** This tool is provided as-is and was built for personal use. The `reindex` and `rename` commands in particular **have not been tested against a real cluster**. Before using them in production, verify the behaviour in a safe environment. As always with cluster operations: make sure you have a snapshot before touching data.
+
 ## Install
 
 Download the latest binary for your platform from the [releases page](../../releases), or build from source:
@@ -78,6 +80,38 @@ osc -e https://my-cluster:9200 health
 | `drain <node>` | Exclude a node from shard allocation to drain it for maintenance |
 | `undrain` | Clear all node allocation exclusions |
 
+### OpenSearch 3.x upgrade helpers
+
+| Command | Description |
+|---|---|
+| `old-indices` | List indices incompatible with OpenSearch 3.x (created on OpenSearch 1.x or Elasticsearch 5–7) |
+| `reindex <source> <dest>` | Start an async reindex and print the task ID ⚠️ untested |
+| `rename <old> <new>` | Delete `old` and create an alias `old → new` (use after a completed reindex) ⚠️ untested |
+
+`reindex` options:
+
+| Flag | Description |
+|---|---|
+| `--batch-size N` | Scroll page size (default: 1000) |
+| `--replace` / `-r` | Wait for completion, verify doc counts match, then delete source and alias `source → dest` ⚠️ untested |
+
+Typical upgrade workflow:
+
+```bash
+# 1. Find which indices need reindexing
+osc old-indices
+
+# 2a. Async — kick it off and come back later
+osc reindex .opendistro-reports-instances .opendistro-reports-instances-v2
+# monitor:  osc get /_tasks/<task-id>
+# swap:     osc rename .opendistro-reports-instances .opendistro-reports-instances-v2
+
+# 2b. One-shot — wait, verify, and swap automatically
+osc reindex .opendistro-reports-instances .opendistro-reports-instances-v2 --replace
+```
+
+The `old-indices` output includes a `CREATED` column (the OpenSearch/Elasticsearch version that originally created the index) and an `UPGRADED` column (the version that last upgraded its Lucene segments in-place, if applicable). Both values come from `?human` on the settings API and are reliable. An upgraded index still needs a full reindex before OpenSearch 3.x will accept it.
+
 ### ISM
 
 | Command | Description |
@@ -106,6 +140,8 @@ osc -e https://my-cluster:9200 health
 --cert <path>         Client certificate PEM (default: /etc/opensearch/tls/admin-cert.pem)
 --key  <path>         Client key PEM         (default: /etc/opensearch/tls/admin-key.pem)
 --curl                Print equivalent curl command to stderr before each request
+--batch-size N        (reindex) Scroll page size (default: 1000)
+--replace, -r         (reindex) Wait, verify counts, then swap source for dest
 ```
 
 ## Examples
