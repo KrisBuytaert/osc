@@ -9,7 +9,6 @@ So I asked Claude to generate this little tool that reads a config file and make
 
 ## Install
 
-Download the latest binary for your platform from the [releases page](../../releases), or build from source:
 
 ```bash
 make build   # linux/amd64, outputs ./osc
