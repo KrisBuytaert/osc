@@ -7,9 +7,7 @@ setup_file() {
   write_test_config
   wait_for_yellow
   create_index "${TEST_INDEX}" 1 0
-  ISM_AVAILABLE=1
   if ! curl -sf "${OS_URL}/_plugins/_ism/policies" >/dev/null 2>&1; then
-    ISM_AVAILABLE=0
     return
   fi
   curl -sf -X PUT "${OS_URL}/_plugins/_ism/policies/${ISM_POLICY_NAME}" \
@@ -27,17 +25,16 @@ teardown_file() {
   [ "$status" -eq 0 ]
 }
 
-@test "retention: prints Fault Tolerance section" {
-  run osc retention
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"=== Fault Tolerance ==="* ]]
-  [[ "$output" == *"Data nodes in cluster:"* ]]
-}
-
-@test "retention: prints Data Retention per Index section" {
+@test "retention: prints Data Retention per Index header" {
   run osc retention
   [ "$status" -eq 0 ]
   [[ "$output" == *"=== Data Retention per Index ==="* ]]
+}
+
+@test "retention: does not print Fault Tolerance section" {
+  run osc retention
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"=== Fault Tolerance ==="* ]]
 }
 
 @test "retention: lists our test index" {
@@ -46,8 +43,8 @@ teardown_file() {
   [[ "$output" == *"${TEST_INDEX}"* ]]
 }
 
-@test "retention: flags a 0-replica index as zero node-loss tolerance" {
+@test "retention: unmanaged index is reported as kept indefinitely" {
   run osc retention
   [ "$status" -eq 0 ]
-  [[ "$output" == *"tolerates losing 0 node(s)"* ]]
+  [[ "$output" == *"${TEST_INDEX}"*"kept indefinitely"* ]]
 }

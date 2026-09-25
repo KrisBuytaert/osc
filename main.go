@@ -700,10 +700,9 @@ func pluralCopies(n int) string {
 	return "copies"
 }
 
-// runRetentionReport prints a human-readable document covering two things
-// ops needs for a cluster: how many nodes it can lose before data becomes
-// unavailable, and how long each index's data is kept for.
-func runRetentionReport(client *OSClient) error {
+// runFaultToleranceReport documents how many nodes the cluster can lose
+// before data becomes unavailable, based on currently STARTED shard copies.
+func runFaultToleranceReport(client *OSClient) error {
 	dataNodes, err := client.GetDataNodeCount()
 	if err != nil {
 		return fmt.Errorf("fetching node count: %w", err)
@@ -722,33 +721,40 @@ func runRetentionReport(client *OSClient) error {
 	fmt.Printf("Data nodes in cluster: %d\n", dataNodes)
 	if minCopies == 0 {
 		fmt.Println("No started shard copies found — cannot assess fault tolerance.")
-	} else {
-		fmt.Printf("Worst case: the cluster can lose %d node(s) before data becomes unavailable.\n", tolerance)
-		if tolerance == 0 {
-			fmt.Println("  At least one shard currently has only 1 copy — losing the node holding it causes data loss / red status.")
-		}
-
-		var counts []int
-		for c := range histogram {
-			counts = append(counts, c)
-		}
-		sort.Ints(counts)
-		fmt.Println("\nShard copies currently in the cluster (1 primary + started replicas):")
-		for _, c := range counts {
-			fmt.Printf("  %4d shard(s) with %d %-8s -> tolerates losing %d node(s)\n", histogram[c], c, pluralCopies(c), c-1)
-		}
-
-		const limit = 10
-		fmt.Printf("\nLeast redundant shards (%d %s each):\n", minCopies, pluralCopies(minCopies))
-		for i, w := range worst {
-			if i >= limit {
-				fmt.Printf("  ... and %d more\n", len(worst)-limit)
-				break
-			}
-			fmt.Printf("  %s (shard %s)\n", w.Index, w.Shard)
-		}
+		return nil
 	}
 
+	fmt.Printf("Worst case: the cluster can lose %d node(s) before data becomes unavailable.\n", tolerance)
+	if tolerance == 0 {
+		fmt.Println("  At least one shard currently has only 1 copy — losing the node holding it causes data loss / red status.")
+	}
+
+	var counts []int
+	for c := range histogram {
+		counts = append(counts, c)
+	}
+	sort.Ints(counts)
+	fmt.Println("\nShard copies currently in the cluster (1 primary + started replicas):")
+	for _, c := range counts {
+		fmt.Printf("  %4d shard(s) with %d %-8s -> tolerates losing %d node(s)\n", histogram[c], c, pluralCopies(c), c-1)
+	}
+
+	const limit = 10
+	fmt.Printf("\nLeast redundant shards (%d %s each):\n", minCopies, pluralCopies(minCopies))
+	for i, w := range worst {
+		if i >= limit {
+			fmt.Printf("  ... and %d more\n", len(worst)-limit)
+			break
+		}
+		fmt.Printf("  %s (shard %s)\n", w.Index, w.Shard)
+	}
+
+	return nil
+}
+
+// runRetentionReport documents how long each index's data is kept for,
+// based on the ISM policy (if any) managing it.
+func runRetentionReport(client *OSClient) error {
 	indexMeta, err := client.GetIndexMeta()
 	if err != nil {
 		return fmt.Errorf("fetching indices: %w", err)
@@ -941,7 +947,8 @@ func printUsage() {
 	fmt.Println("  allocation-explain [body]  Explain shard allocation; optional JSON body targets a shard")
 	fmt.Println("  reroute <body>             POST _cluster/reroute; body from arg or stdin")
 	fmt.Println("  ism                        List ISM policies")
-	fmt.Println("  retention                  Document fault tolerance (node loss) and per-index data retention")
+	fmt.Println("  retention                  Document how long each index's data is kept for (ISM policy based)")
+	fmt.Println("  fault-tolerance            Document how many nodes the cluster can lose before data becomes unavailable")
 	fmt.Println("  rebalance                  Re-enable allocation and retry failed shard assignments")
 	fmt.Println("  drain <node>               Exclude a node from receiving shards (triggers drain)")
 	fmt.Println("  undrain                    Clear node allocation exclusions")
@@ -1283,6 +1290,12 @@ func main() {
 
 	case "retention":
 		if err := runRetentionReport(client); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "fault-tolerance":
+		if err := runFaultToleranceReport(client); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
