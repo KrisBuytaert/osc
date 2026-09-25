@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -66,6 +67,54 @@ type OSClient struct {
 	config     Config
 	httpClient *http.Client
 	showCurl   bool
+}
+
+// ShardEntry is one row of _cat/shards, used to work out how many live
+// copies of a shard currently exist and where they sit.
+type ShardEntry struct {
+	Index  string `json:"index"`
+	Shard  string `json:"shard"`
+	PriRep string `json:"prirep"`
+	State  string `json:"state"`
+	Node   string `json:"node"`
+}
+
+// IndexMeta is a minimal per-index row (creation date + replica count) used
+// for the retention report.
+type IndexMeta struct {
+	Index        string `json:"index"`
+	Pri          string `json:"pri"`
+	Rep          string `json:"rep"`
+	CreationDate string `json:"creation.date"`
+}
+
+type ismState struct {
+	Name        string                       `json:"name"`
+	Actions     []map[string]json.RawMessage `json:"actions"`
+	Transitions []struct {
+		StateName  string                     `json:"state_name"`
+		Conditions map[string]json.RawMessage `json:"conditions"`
+	} `json:"transitions"`
+}
+
+// ismPolicyRetention is the outcome of walking a policy's state machine to
+// find how long it keeps data before a delete action fires.
+type ismPolicyRetention struct {
+	Days  float64
+	Known bool
+	Note  string // set when Known is false, explains why
+}
+
+type ismExplainEntry struct {
+	PolicyID string `json:"policy_id"`
+}
+
+// shardGroupStat is the copy count (primary + started replicas) for one
+// index/shard pair.
+type shardGroupStat struct {
+	Index  string
+	Shard  string
+	Copies int
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -405,6 +454,357 @@ func (c *OSClient) GetOldVersionIndices() ([]OldVersionIndex, error) {
 	return result, nil
 }
 
+// GetDataNodeCount returns the number of nodes carrying the "data" role.
+func (c *OSClient) GetDataNodeCount() (int, error) {
+	data, err := c.request("GET", "/_cat/nodes?format=json&h=name,node.role", nil)
+	if err != nil {
+		return 0, err
+	}
+	var nodes []struct {
+		Name string `json:"name"`
+		Role string `json:"node.role"`
+	}
+	if err := json.Unmarshal(data, &nodes); err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, n := range nodes {
+		if strings.Contains(n.Role, "d") {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// GetShardEntries returns one row per shard copy, used to compute how many
+// live copies of each shard currently exist.
+func (c *OSClient) GetShardEntries() ([]ShardEntry, error) {
+	data, err := c.request("GET", "/_cat/shards?format=json&h=index,shard,prirep,state,node", nil)
+	if err != nil {
+		return nil, err
+	}
+	var entries []ShardEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// GetIndexMeta returns creation date and replica count for every index.
+func (c *OSClient) GetIndexMeta() ([]IndexMeta, error) {
+	data, err := c.request("GET", "/_cat/indices?format=json&h=index,pri,rep,creation.date", nil)
+	if err != nil {
+		return nil, err
+	}
+	var meta []IndexMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
+	return meta, nil
+}
+
+// GetISMPolicyRetention fetches every ISM policy and works out, per policy,
+// how long it retains data before a delete action fires.
+func (c *OSClient) GetISMPolicyRetention() (map[string]ismPolicyRetention, error) {
+	data, err := c.request("GET", "/_plugins/_ism/policies", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Policies []struct {
+			Policy struct {
+				PolicyID string     `json:"policy_id"`
+				States   []ismState `json:"states"`
+			} `json:"policy"`
+		} `json:"policies"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse ISM policies: %w", err)
+	}
+
+	result := make(map[string]ismPolicyRetention)
+	for _, p := range resp.Policies {
+		result[p.Policy.PolicyID] = computePolicyRetention(p.Policy.States)
+	}
+	return result, nil
+}
+
+// GetISMExplain returns, for every ISM-managed index, which policy manages
+// it and when the index was created.
+func (c *OSClient) GetISMExplain() (map[string]ismExplainEntry, error) {
+	data, err := c.request("GET", "/_plugins/_ism/explain/*", nil)
+	if err != nil {
+		return nil, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("failed to parse ISM explain: %w", err)
+	}
+	delete(raw, "total_managed_indices")
+
+	result := make(map[string]ismExplainEntry)
+	for name, v := range raw {
+		var entry ismExplainEntry
+		if err := json.Unmarshal(v, &entry); err != nil {
+			continue
+		}
+		result[name] = entry
+	}
+	return result, nil
+}
+
+// computePolicyRetention walks a policy's states looking for a state with a
+// "delete" action, then finds the min_index_age condition that leads into
+// it. min_index_age in ISM is measured from index creation, so this is
+// directly the retention period.
+func computePolicyRetention(states []ismState) ismPolicyRetention {
+	deleteStates := map[string]bool{}
+	for _, s := range states {
+		for _, a := range s.Actions {
+			if _, has := a["delete"]; has {
+				deleteStates[s.Name] = true
+			}
+		}
+	}
+	if len(deleteStates) == 0 {
+		return ismPolicyRetention{Note: "no delete action in policy — data is retained indefinitely by ISM"}
+	}
+
+	found := false
+	minDays := math.MaxFloat64
+	nonAgeCondition := false
+	for _, s := range states {
+		for _, t := range s.Transitions {
+			if !deleteStates[t.StateName] {
+				continue
+			}
+			if raw, ok := t.Conditions["min_index_age"]; ok {
+				var ageStr string
+				if err := json.Unmarshal(raw, &ageStr); err == nil {
+					if d, err := parseISMDuration(ageStr); err == nil {
+						found = true
+						if d < minDays {
+							minDays = d
+						}
+					}
+				}
+			} else if len(t.Conditions) > 0 {
+				nonAgeCondition = true
+			}
+		}
+	}
+
+	if found {
+		return ismPolicyRetention{Days: minDays, Known: true}
+	}
+	if nonAgeCondition {
+		return ismPolicyRetention{Note: "delete is conditioned on something other than index age (e.g. size/doc count) — retention period can't be predicted"}
+	}
+	return ismPolicyRetention{Note: "delete state has no reachable age-based transition — retention period unknown"}
+}
+
+// parseISMDuration parses OpenSearch TimeValue strings (e.g. "30d", "12h")
+// into a number of days.
+func parseISMDuration(s string) (float64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	unit := s[len(s)-1:]
+	numPart := s[:len(s)-1]
+	if strings.HasSuffix(s, "ms") {
+		unit = "ms"
+		numPart = s[:len(s)-2]
+	}
+	n, err := strconv.ParseFloat(numPart, 64)
+	if err != nil {
+		return 0, err
+	}
+	switch unit {
+	case "d":
+		return n, nil
+	case "h":
+		return n / 24, nil
+	case "m":
+		return n / 1440, nil
+	case "s":
+		return n / 86400, nil
+	case "ms":
+		return n / 86400000, nil
+	default:
+		return 0, fmt.Errorf("unknown time unit in %q", s)
+	}
+}
+
+// computeFaultTolerance looks at currently STARTED shard copies and, per
+// index/shard, counts how many distinct nodes hold one. The cluster-wide
+// minimum is the worst case: how many nodes can be lost before some shard
+// loses its last copy.
+func computeFaultTolerance(entries []ShardEntry) (minCopies int, worst []shardGroupStat, histogram map[int]int) {
+	type key struct{ index, shard string }
+	groups := make(map[key]map[string]bool)
+	var order []key
+	for _, e := range entries {
+		if e.State != "STARTED" {
+			continue
+		}
+		k := key{e.Index, e.Shard}
+		if groups[k] == nil {
+			groups[k] = map[string]bool{}
+			order = append(order, k)
+		}
+		groups[k][e.Node] = true
+	}
+
+	histogram = map[int]int{}
+	minCopies = math.MaxInt32
+	for _, k := range order {
+		n := len(groups[k])
+		histogram[n]++
+		stat := shardGroupStat{Index: k.index, Shard: k.shard, Copies: n}
+		if n < minCopies {
+			minCopies = n
+			worst = []shardGroupStat{stat}
+		} else if n == minCopies {
+			worst = append(worst, stat)
+		}
+	}
+	if minCopies == math.MaxInt32 {
+		minCopies = 0
+	}
+	return
+}
+
+func formatDays(days float64) string {
+	if days < 1 {
+		return fmt.Sprintf("%.0f hours", days*24)
+	}
+	return fmt.Sprintf("%.0f days", days)
+}
+
+func formatAge(creationMillis int64) string {
+	if creationMillis == 0 {
+		return "unknown"
+	}
+	age := time.Since(time.UnixMilli(creationMillis))
+	if age.Hours() < 24 {
+		return fmt.Sprintf("%.0fh", age.Hours())
+	}
+	return fmt.Sprintf("%.0fd", age.Hours()/24)
+}
+
+func pluralCopies(n int) string {
+	if n == 1 {
+		return "copy"
+	}
+	return "copies"
+}
+
+// runRetentionReport prints a human-readable document covering two things
+// ops needs for a cluster: how many nodes it can lose before data becomes
+// unavailable, and how long each index's data is kept for.
+func runRetentionReport(client *OSClient) error {
+	dataNodes, err := client.GetDataNodeCount()
+	if err != nil {
+		return fmt.Errorf("fetching node count: %w", err)
+	}
+	shardEntries, err := client.GetShardEntries()
+	if err != nil {
+		return fmt.Errorf("fetching shards: %w", err)
+	}
+	minCopies, worst, histogram := computeFaultTolerance(shardEntries)
+	tolerance := minCopies - 1
+	if tolerance < 0 {
+		tolerance = 0
+	}
+
+	fmt.Println("\n=== Fault Tolerance ===")
+	fmt.Printf("Data nodes in cluster: %d\n", dataNodes)
+	if minCopies == 0 {
+		fmt.Println("No started shard copies found — cannot assess fault tolerance.")
+	} else {
+		fmt.Printf("Worst case: the cluster can lose %d node(s) before data becomes unavailable.\n", tolerance)
+		if tolerance == 0 {
+			fmt.Println("  At least one shard currently has only 1 copy — losing the node holding it causes data loss / red status.")
+		}
+
+		var counts []int
+		for c := range histogram {
+			counts = append(counts, c)
+		}
+		sort.Ints(counts)
+		fmt.Println("\nShard copies currently in the cluster (1 primary + started replicas):")
+		for _, c := range counts {
+			fmt.Printf("  %4d shard(s) with %d %-8s -> tolerates losing %d node(s)\n", histogram[c], c, pluralCopies(c), c-1)
+		}
+
+		const limit = 10
+		fmt.Printf("\nLeast redundant shards (%d %s each):\n", minCopies, pluralCopies(minCopies))
+		for i, w := range worst {
+			if i >= limit {
+				fmt.Printf("  ... and %d more\n", len(worst)-limit)
+				break
+			}
+			fmt.Printf("  %s (shard %s)\n", w.Index, w.Shard)
+		}
+	}
+
+	indexMeta, err := client.GetIndexMeta()
+	if err != nil {
+		return fmt.Errorf("fetching indices: %w", err)
+	}
+	policies, err := client.GetISMPolicyRetention()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not fetch ISM policies: %v\n", err)
+		policies = map[string]ismPolicyRetention{}
+	}
+	explain, err := client.GetISMExplain()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not fetch ISM explain data: %v\n", err)
+		explain = map[string]ismExplainEntry{}
+	}
+
+	fmt.Println("\n=== Data Retention per Index ===")
+	fmt.Printf("%-45s  %-6s  %-4s  %-25s  %-11s  %s\n", "INDEX", "AGE", "REP", "ISM POLICY", "RETENTION", "STATUS")
+	fmt.Println(strings.Repeat("-", 130))
+
+	sort.Slice(indexMeta, func(i, j int) bool { return indexMeta[i].Index < indexMeta[j].Index })
+
+	for _, idx := range indexMeta {
+		createdMillis, _ := strconv.ParseInt(idx.CreationDate, 10, 64)
+		age := formatAge(createdMillis)
+
+		policyID := "—"
+		retentionStr := "—"
+		status := "no ISM policy — kept indefinitely"
+
+		if entry, managed := explain[idx.Index]; managed && entry.PolicyID != "" {
+			policyID = entry.PolicyID
+			if ret, ok := policies[entry.PolicyID]; ok {
+				if ret.Known {
+					retentionStr = formatDays(ret.Days)
+					ageDays := time.Since(time.UnixMilli(createdMillis)).Hours() / 24
+					remaining := ret.Days - ageDays
+					if remaining <= 0 {
+						status = "past retention window (delete pending/imminent)"
+					} else {
+						status = fmt.Sprintf("deletes in ~%.0f days", remaining)
+					}
+				} else {
+					retentionStr = "n/a"
+					status = ret.Note
+				}
+			} else {
+				status = "policy referenced but not found (may have been deleted)"
+			}
+		}
+
+		fmt.Printf("%-45s  %-6s  %-4s  %-25s  %-11s  %s\n", idx.Index, age, idx.Rep, policyID, retentionStr, status)
+	}
+
+	return nil
+}
+
 // ReindexAsync starts a reindex task on the server and returns its task ID.
 // batchSize controls the scroll page size (default 1000).
 func (c *OSClient) ReindexAsync(source, dest string, batchSize int) (string, error) {
@@ -541,6 +941,7 @@ func printUsage() {
 	fmt.Println("  allocation-explain [body]  Explain shard allocation; optional JSON body targets a shard")
 	fmt.Println("  reroute <body>             POST _cluster/reroute; body from arg or stdin")
 	fmt.Println("  ism                        List ISM policies")
+	fmt.Println("  retention                  Document fault tolerance (node loss) and per-index data retention")
 	fmt.Println("  rebalance                  Re-enable allocation and retry failed shard assignments")
 	fmt.Println("  drain <node>               Exclude a node from receiving shards (triggers drain)")
 	fmt.Println("  undrain                    Clear node allocation exclusions")
@@ -878,6 +1279,12 @@ func main() {
 			fmt.Println(pretty)
 		} else {
 			fmt.Println(string(data))
+		}
+
+	case "retention":
+		if err := runRetentionReport(client); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
 		}
 
 	case "rebalance":

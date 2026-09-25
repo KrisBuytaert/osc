@@ -1,4 +1,6 @@
+.gitignore 
 osc
 go.sum
+.forgejo/*
 
 
