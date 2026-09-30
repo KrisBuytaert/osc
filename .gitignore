@@ -1,6 +1,8 @@
-.gitignore 
+.gitignore
 osc
 go.sum
 .forgejo/*
-
+CLAUDE.md
+*.md
+.antigravitycli
 

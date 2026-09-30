@@ -117,6 +117,13 @@ The `old-indices` output includes a `CREATED` column (the OpenSearch/Elasticsear
 |---|---|
 | `ism` | List all ISM (Index State Management) policies |
 
+### Reporting
+
+| Command | Description |
+|---|---|
+| `retention` | Per-index data retention: age, replica count, ISM policy, and days until the policy deletes it |
+| `fault-tolerance` | How many nodes the cluster can lose right now before data becomes unavailable, based on live shard copy counts |
+
 ### Raw requests
 
 | Command | Description |
